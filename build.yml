@@ -1,0 +1,271 @@
+name: Build Windows VST3
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Create C++ Source Files
+        run: |
+          Set-Content -Path "TraktorGaterEngine.h" -Value @'
+          #pragma once
+          #include <cmath>
+          #include <algorithm>
+          #include <cstdint>
+          #include <atomic>
+          class TraktorGaterEngine {
+          public:
+              TraktorGaterEngine() { loadPresetPattern(0); reset(); }
+              void prepare(double sr) { sampleRate = static_cast<float>(sr); reset(); }
+              void reset() { gateGainState = 0.0f; freeRunningBeat = 0.0f; filterL_z1 = filterL_z2 = 0.0f; filterR_z1 = filterR_z2 = 0.0f; }
+              int getActiveStep() const noexcept { return activeStep.load(std::memory_order_relaxed); }
+              float getCurrentGateGain() const noexcept { return currentGateOut.load(std::memory_order_relaxed); }
+              bool getStepActive(int step) const noexcept { return stepStates[step & 15].load(std::memory_order_relaxed); }
+              void setStepActive(int step, bool isActive) noexcept { stepStates[step & 15].store(isActive, std::memory_order_relaxed); }
+              void syncPatternIndex(int patIndex) noexcept { lastPatternIndex = std::clamp(patIndex, 0, 7); }
+              void loadPresetPattern(int patIndex) noexcept {
+                  static const bool PATTERNS[8][16] = {
+                      {1, 1, 0, 1,  0, 1, 1, 0,  1, 0, 1, 1,  0, 1, 0, 1},
+                      {0, 1, 0, 1,  0, 1, 0, 1,  0, 1, 0, 1,  0, 1, 0, 1},
+                      {1, 0, 0, 1,  0, 0, 1, 0,  1, 0, 0, 1,  0, 1, 0, 0},
+                      {1, 1, 0, 0,  1, 1, 0, 0,  1, 1, 1, 0,  0, 0, 1, 1},
+                      {1, 0, 1, 0,  1, 1, 0, 1,  1, 1, 1, 1,  0, 1, 0, 1},
+                      {1, 0, 0, 1,  0, 0, 1, 0,  0, 1, 0, 0,  1, 0, 1, 0},
+                      {1, 1, 1, 0,  1, 1, 1, 0,  1, 0, 1, 0,  1, 1, 0, 1},
+                      {1, 0, 0, 0,  1, 0, 1, 0,  1, 1, 1, 0,  1, 1, 1, 1}
+                  };
+                  int clamped = std::clamp(patIndex, 0, 7);
+                  for(int i=0; i<16; ++i) stepStates[i].store(PATTERNS[clamped][i], std::memory_order_relaxed);
+                  lastPatternIndex = clamped;
+              }
+              void process(float* left, float* right, int numSamples, double bpm, double ppq, bool isPlaying, int rateIdx, int patIdx, float shape, float swing, float noiseMix, float noiseColor, float dryWet) {
+                  if (patIdx != lastPatternIndex) loadPresetPattern(patIdx);
+                  float normFreq = std::clamp(noiseColor, 20.0f, sampleRate * 0.49f);
+                  float w0 = 2.0f * 3.14159265f * (normFreq / sampleRate);
+                  float alpha = std::sin(w0) / (2.0f * 1.4f);
+                  float a0 = 1.0f + alpha;
+                  b0 = alpha / a0; b1 = 0.0f; b2 = -alpha / a0; a1 = (-2.0f * std::cos(w0)) / a0; a2 = (1.0f - alpha) / a0;
+                  
+                  float stepsPerBeat = (rateIdx == 0) ? 1.0f : (rateIdx == 1) ? 2.0f : (rateIdx == 2) ? 4.0f : (rateIdx == 3) ? 8.0f : (rateIdx == 4) ? 3.0f : 6.0f;
+                  float safeTempo = (bpm > 20.0) ? static_cast<float>(bpm) : 120.0f;
+                  float beatsPerSample = (safeTempo / 60.0f) / sampleRate;
+                  float attackCoeff = std::exp(-1.0f / (0.0008f * sampleRate));
+                  float releaseCoeff = std::exp(-1.0f / (0.006f * sampleRate));
+                  float splitPoint = 0.5f + swing * 0.18f;
+                  float gateThreshold = std::clamp(shape * 0.9f + 0.05f, 0.05f, 0.95f);
+                  int latestStepIdx = 0;
+
+                  for (int i = 0; i < numSamples; ++i) {
+                      float beat = isPlaying ? (static_cast<float>(ppq) + (i * beatsPerSample)) : (freeRunningBeat += beatsPerSample);
+                      if (!isPlaying && freeRunningBeat >= 16.0f) freeRunningBeat -= 16.0f;
+                      float totalStepPos = beat * stepsPerBeat;
+                      float pairPos = totalStepPos * 0.5f;
+                      int basePairStep = static_cast<int>(std::floor(pairPos)) * 2;
+                      float pairFrac = pairPos - std::floor(pairPos);
+                      int stepIdx = (pairFrac < splitPoint) ? ((basePairStep % 16) + 16) % 16 : (((basePairStep + 1) % 16) + 16) % 16;
+                      latestStepIdx = stepIdx;
+                      
+                      float targetGate = (stepStates[stepIdx].load(std::memory_order_relaxed) && ((pairFrac < splitPoint ? pairFrac / splitPoint : (pairFrac - splitPoint)/(1.0f - splitPoint)) < gateThreshold)) ? 1.0f : 0.0f;
+                      gateGainState = (targetGate > gateGainState) ? gateGainState * attackCoeff + targetGate * (1.0f - attackCoeff) : gateGainState * releaseCoeff + targetGate * (1.0f - releaseCoeff);
+                      
+                      float rawL = (fastRand() * 2.0f - 1.0f) * 0.6f; float rawR = (fastRand() * 2.0f - 1.0f) * 0.6f;
+                      float flL = b0 * rawL + filterL_z1; filterL_z1 = b1 * rawL - a1 * flL + filterL_z2; filterL_z2 = b2 * rawL - a2 * flL;
+                      float flR = b0 * rawR + filterR_z1; filterR_z1 = b1 * rawR - a1 * flR + filterR_z2; filterR_z2 = b2 * rawR - a2 * flR;
+                      
+                      float wetL = (left[i] * gateGainState) + (flL * (gateGainState * noiseMix * 1.5f));
+                      float wetR = ((right ? right[i] : left[i]) * gateGainState) + (flR * (gateGainState * noiseMix * 1.5f));
+                      left[i] = std::clamp(left[i] * (1.0f - dryWet) + wetL * dryWet, -1.0f, 1.0f);
+                      if (right) right[i] = std::clamp(right[i] * (1.0f - dryWet) + wetR * dryWet, -1.0f, 1.0f);
+                  }
+                  activeStep.store(latestStepIdx, std::memory_order_relaxed);
+                  currentGateOut.store(gateGainState, std::memory_order_relaxed);
+              }
+          private:
+              float sampleRate = 44100.0f, gateGainState = 0.0f, freeRunningBeat = 0.0f;
+              int lastPatternIndex = 0;
+              std::atomic<int> activeStep{0}; std::atomic<float> currentGateOut{0.0f}; std::atomic<bool> stepStates[16];
+              float b0=1.0f, b1=0.0f, b2=0.0f, a1=0.0f, a2=0.0f, filterL_z1=0.0f, filterL_z2=0.0f, filterR_z1=0.0f, filterR_z2=0.0f;
+              uint32_t rngState=123456789;
+              float fastRand() { rngState = rngState * 1664525u + 1013904223u; return static_cast<float>(rngState) / 4294967296.0f; }
+          };
+          '@
+
+          Set-Content -Path "StepVisualizer.h" -Value @'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "TraktorGaterEngine.h"
+          class StepVisualizer : public juce::Component, private juce::Timer {
+          public:
+              StepVisualizer(TraktorGaterEngine& eng, juce::AudioProcessorValueTreeState& state) : engine(eng), apvts(state) { startTimerHz(60); }
+              ~StepVisualizer() override { stopTimer(); }
+              void paint(juce::Graphics& g) override {
+                  auto bounds = getLocalBounds().toFloat(); int curStep = engine.getActiveStep(); float gateGain = engine.getCurrentGateGain();
+                  float duty = std::clamp(apvts.getRawParameterValue("shape")->load() * 0.9f + 0.05f, 0.05f, 0.95f);
+                  g.setColour(juce::Colour(0xff111114)); g.fillRoundedRectangle(bounds, 6.0f);
+                  float stepW = (bounds.getWidth() - 62.0f) / 16.0f; float x = 8.0f;
+                  for (int i = 0; i < 16; ++i) {
+                      bool on = engine.getStepActive(i); bool play = (i == curStep);
+                      juce::Rectangle<float> pad(x, 8.0f, stepW, bounds.getHeight() - 24.0f);
+                      g.setColour(on ? juce::Colour(0xff382210) : juce::Colour(0xff222226)); g.fillRoundedRectangle(pad, 4.0f);
+                      if (on) { g.setColour(play ? juce::Colour(0xffff7a00).interpolatedWith(juce::Colours::white, gateGain*0.55f) : juce::Colour(0xffd96400)); g.fillRoundedRectangle(pad.withWidth(pad.getWidth() * duty), 4.0f); }
+                      g.setColour(play ? juce::Colours::white : juce::Colour(0xff333338)); g.drawRoundedRectangle(pad, 4.0f, play ? 2.0f : 1.0f);
+                      g.setColour(play ? juce::Colours::white : (i%4==0 ? juce::Colour(0xffff7a00) : juce::Colours::grey));
+                      g.setFont(10.0f); g.drawText(juce::String(i+1), juce::Rectangle<float>(x, pad.getBottom()+2.0f, stepW, 12.0f), juce::Justification::centred, false);
+                      x += stepW + (i%4 == 3 ? 6.0f : 4.0f);
+                  }
+              }
+              void mouseDown(const juce::MouseEvent& e) { handleMouse(e.position); }
+              void mouseDrag(const juce::MouseEvent& e) { handleMouse(e.position); }
+          private:
+              TraktorGaterEngine& engine; juce::AudioProcessorValueTreeState& apvts;
+              void timerCallback() override { repaint(); }
+              void handleMouse(juce::Point<float> pos) {
+                  float stepW = (getLocalBounds().getWidth() - 62.0f) / 16.0f; float x = 8.0f;
+                  for (int i = 0; i < 16; ++i) {
+                      juce::Rectangle<float> pad(x, 8.0f, stepW, getLocalBounds().getHeight() - 24.0f);
+                      if (pad.contains(pos)) { engine.setStepActive(i, !engine.getStepActive(i)); repaint(); break; }
+                      x += stepW + (i%4 == 3 ? 6.0f : 4.0f);
+                  }
+              }
+          };
+          '@
+
+          Set-Content -Path "PluginProcessor.h" -Value @'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "TraktorGaterEngine.h"
+          class TraktorGaterAudioProcessor : public juce::AudioProcessor {
+          public:
+              TraktorGaterAudioProcessor();
+              ~TraktorGaterAudioProcessor() override = default;
+              void prepareToPlay(double sr, int) override { gaterEngine.prepare(sr); }
+              void releaseResources() override { gaterEngine.reset(); }
+              bool isBusesLayoutSupported(const BusesLayout& l) const override { return l.getMainOutputChannelSet() == l.getMainInputChannelSet() && (l.getMainOutputChannelSet() == juce::AudioChannelSet::mono() || l.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()); }
+              void processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override {
+                  double bpm=120.0, ppq=0.0; bool isPlaying=false;
+                  if (auto* ph = getPlayHead()) if (auto pos = ph->getPosition()) { bpm = pos->getBpm().or_default(120.0); ppq = pos->getPpqPosition().or_default(0.0); isPlaying = pos->getIsPlaying(); }
+                  gaterEngine.process(b.getWritePointer(0), b.getNumChannels()>1 ? b.getWritePointer(1) : nullptr, b.getNumSamples(), bpm, ppq, isPlaying, apvts.getRawParameterValue("rate")->load(), apvts.getRawParameterValue("pattern")->load(), apvts.getRawParameterValue("shape")->load(), apvts.getRawParameterValue("swing")->load(), apvts.getRawParameterValue("noiseMix")->load(), apvts.getRawParameterValue("noiseColor")->load(), apvts.getRawParameterValue("dryWet")->load());
+              }
+              juce::AudioProcessorEditor* createEditor() override;
+              bool hasEditor() const override { return true; }
+              const juce::String getName() const override { return JucePlugin_Name; }
+              bool acceptsMidi() const override { return false; } bool producesMidi() const override { return false; } bool isMidiEffect() const override { return false; }
+              double getTailLengthSeconds() const override { return 0.0; }
+              int getNumPrograms() override { return 1; } int getCurrentProgram() override { return 0; } void setCurrentProgram(int) override {} const juce::String getProgramName(int) override { return {}; } void changeProgramName(int, const juce::String&) override {}
+              void getStateInformation(juce::MemoryBlock& dest) override {
+                  auto state = apvts.copyState(); std::unique_ptr<juce::XmlElement> xml(state.createXml());
+                  juce::String mask; for (int i=0; i<16; ++i) mask += gaterEngine.getStepActive(i) ? "1" : "0";
+                  xml->setAttribute("customStepMask", mask); copyXmlToBinary(*xml, dest);
+              }
+              void setStateInformation(const void* data, int size) override {
+                  std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, size));
+                  if (xml && xml->hasTagName(apvts.state.getType())) {
+                      apvts.replaceState(juce::ValueTree::fromXml(*xml));
+                      gaterEngine.syncPatternIndex(apvts.getRawParameterValue("pattern")->load());
+                      if (xml->hasAttribute("customStepMask")) {
+                          juce::String mask = xml->getStringAttribute("customStepMask");
+                          for (int i=0; i<juce::jmin(16, mask.length()); ++i) gaterEngine.setStepActive(i, mask[i] == '1');
+                      }
+                  }
+              }
+              TraktorGaterEngine& getEngine() noexcept { return gaterEngine; }
+              juce::AudioProcessorValueTreeState apvts;
+          private:
+              TraktorGaterEngine gaterEngine;
+          };
+          '@
+
+          Set-Content -Path "PluginProcessor.cpp" -Value @'
+          #include "PluginProcessor.h"
+          #include "PluginEditor.h"
+          TraktorGaterAudioProcessor::TraktorGaterAudioProcessor() : AudioProcessor(BusesProperties().withInput("Input", juce::AudioChannelSet::stereo(), true).withOutput("Output", juce::AudioChannelSet::stereo(), true)), apvts(*this, nullptr, "Parameters", {
+              std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{"rate",1}, "Rate", juce::StringArray{"1/4","1/8","1/16","1/32","1/8T","1/16T"}, 2),
+              std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{"pattern",1}, "Pattern", juce::StringArray{"Classic","Offbeat","Staccato","Half Time","Roll","Polyrhythm","Triplet Rush","Buildup"}, 0),
+              std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"shape",1}, "Shape", juce::NormalisableRange<float>(0.0f,1.0f,0.01f), 0.5f),
+              std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"swing",1}, "Swing", juce::NormalisableRange<float>(0.0f,1.0f,0.01f), 0.0f),
+              std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"noiseMix",1}, "Noise Mix", juce::NormalisableRange<float>(0.0f,1.0f,0.01f), 0.15f),
+              std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"noiseColor",1}, "Noise Color", juce::NormalisableRange<float>(500.0f,12000.0f,1.0f,0.4f), 2500.0f),
+              std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"dryWet",1}, "Dry/Wet", juce::NormalisableRange<float>(0.0f,1.0f,0.01f), 1.0f)
+          }) {}
+          juce::AudioProcessorEditor* TraktorGaterAudioProcessor::createEditor() { return new TraktorGaterAudioProcessorEditor(*this); }
+          juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new TraktorGaterAudioProcessor(); }
+          '@
+
+          Set-Content -Path "PluginEditor.h" -Value @'
+          #pragma once
+          #include <JuceHeader.h>
+          #include "PluginProcessor.h"
+          #include "StepVisualizer.h"
+          class TraktorGaterAudioProcessorEditor : public juce::AudioProcessorEditor {
+          public:
+              explicit TraktorGaterAudioProcessorEditor(TraktorGaterAudioProcessor& p) : AudioProcessorEditor(&p), proc(p), stepVis(p.getEngine(), p.apvts) {
+                  rateBox.addItemList({"1/4","1/8","1/16","1/32","1/8T","1/16T"}, 1); addAndMakeVisible(rateBox); addAndMakeVisible(rateLbl); rateLbl.setText("RATE", juce::dontSendNotification);
+                  patBox.addItemList({"Classic","Offbeat","Staccato","Half Time","Roll","Polyrhythm","Triplet Rush","Buildup"}, 1); addAndMakeVisible(patBox); addAndMakeVisible(patLbl); patLbl.setText("PATTERN", juce::dontSendNotification);
+                  addAndMakeVisible(stepVis);
+                  setupSlider(shapeS, shapeL, "SHAPE"); setupSlider(swingS, swingL, "SWING"); setupSlider(noiseMixS, noiseMixL, "NOISE MIX"); setupSlider(noiseColorS, noiseColorL, "COLOR (Hz)"); setupSlider(dryWetS, dryWetL, "DRY/WET");
+                  rateAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "rate", rateBox);
+                  patAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "pattern", patBox);
+                  shapeAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.apvts, "shape", shapeS);
+                  swingAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.apvts, "swing", swingS);
+                  noiseMixAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.apvts, "noiseMix", noiseMixS);
+                  noiseColorAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.apvts, "noiseColor", noiseColorS);
+                  dryWetAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.apvts, "dryWet", dryWetS);
+                  setSize(560, 340);
+              }
+              void paint(juce::Graphics& g) override { g.fillAll(juce::Colour(0xff1a1a1d)); g.setColour(juce::Colour(0xff28282c)); g.fillRect(0, 0, getWidth(), 45); g.setColour(juce::Colour(0xffff7a00)); g.setFont(18.0f); g.drawText("TRAKTOR GATER", 20, 0, 200, 45, juce::Justification::centredLeft); }
+              void resized() override {
+                  rateLbl.setBounds(230, 10, 45, 25); rateBox.setBounds(275, 10, 90, 25);
+                  patLbl.setBounds(380, 10, 65, 25); patBox.setBounds(445, 10, 100, 25);
+                  stepVis.setBounds(15, 58, getWidth() - 30, 72);
+                  int w = getWidth() / 5;
+                  juce::Slider* sliders[] = {&shapeS, &swingS, &noiseMixS, &noiseColorS, &dryWetS};
+                  juce::Label* labels[] = {&shapeL, &swingL, &noiseMixL, &noiseColorL, &dryWetL};
+                  for (int i=0; i<5; ++i) { labels[i]->setBounds(i*w, 145, w, 20); sliders[i]->setBounds(i*w + 10, 170, w - 20, 145); }
+              }
+          private:
+              void setupSlider(juce::Slider& s, juce::Label& l, const juce::String& name) {
+                  s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag); s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 20);
+                  s.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour(0xffff7a00)); addAndMakeVisible(s);
+                  l.setText(name, juce::dontSendNotification); l.setJustificationType(juce::Justification::centred); addAndMakeVisible(l);
+              }
+              TraktorGaterAudioProcessor& proc; StepVisualizer stepVis;
+              juce::ComboBox rateBox, patBox; juce::Label rateLbl, patLbl, shapeL, swingL, noiseMixL, noiseColorL, dryWetL;
+              juce::Slider shapeS, swingS, noiseMixS, noiseColorS, dryWetS;
+              std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> rateAtt, patAtt;
+              std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> shapeAtt, swingAtt, noiseMixAtt, noiseColorAtt, dryWetAtt;
+          };
+          '@
+
+          Set-Content -Path "PluginEditor.cpp" -Value @'
+          #include "PluginEditor.h"
+          '@
+
+          Set-Content -Path "CMakeLists.txt" -Value @'
+          cmake_minimum_required(VERSION 3.22)
+          project(TraktorGater VERSION 1.0.0)
+          set(CMAKE_CXX_STANDARD 17)
+          include(FetchContent)
+          FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/juce-framework/JUCE.git GIT_TAG 8.0.4 GIT_SHALLOW TRUE)
+          FetchContent_MakeAvailable(JUCE)
+          juce_add_plugin(TraktorGater COMPANY_NAME "CustomAudio" IS_SYNTH FALSE NEEDS_MIDI_INPUT FALSE NEEDS_MIDI_OUTPUT FALSE IS_MIDI_EFFECT FALSE PLUGIN_MANUFACTURER_CODE Cstm PLUGIN_CODE TrGt FORMATS VST3 PRODUCT_NAME "Traktor Gater")
+          juce_generate_juce_header(TraktorGater)
+          target_sources(TraktorGater PRIVATE TraktorGaterEngine.h StepVisualizer.h PluginProcessor.h PluginProcessor.cpp PluginEditor.h PluginEditor.cpp)
+          target_compile_definitions(TraktorGater PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
+          target_link_libraries(TraktorGater PRIVATE juce::juce_audio_utils PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags)
+          '@
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build VST3
+        run: cmake --build build --config Release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Traktor-Gater-VST3
+          path: build/TraktorGater_artefacts/Release/VST3/Traktor Gater.vst3
